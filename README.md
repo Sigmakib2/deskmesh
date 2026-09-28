@@ -61,7 +61,8 @@ The primary's normal Windows audio continues through its usual output. Remote au
 - **No remote audio:** Check that the secondary plays through the selected output, list devices on both PCs, and verify UDP `47661` is allowed through the primary firewall. Try a specific `capture_device` and `playback_device`.
 - **Input is not injected into an elevated app:** Windows prevents a normal-privilege process from injecting into higher-privilege windows. Run the secondary DeskMesh process at the needed privilege level only if you trust it.
 - **Hotkeys fail:** Run the primary from an interactive desktop session. Windows secure desktop (such as the UAC prompt and lock screen) cannot be controlled by these hooks.
-- **Unexpected stop:** Add `--debug` before the role command for detailed logs, e.g. `deskmesh.py --debug primary`.
+- **Hotkeys or audio behaving oddly:** Start both PCs with `powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1 -DebugLog`. The main PC logs detected hotkeys and audio buffer health. Send the last few terminal lines from both PCs when reporting a problem.
+- **Unexpected stop:** The same `-DebugLog` option provides detailed logs. Manual commands can use `deskmesh.py --debug primary`.
 
 ## Security and limits
 

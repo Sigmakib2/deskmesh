@@ -1,7 +1,8 @@
 param(
     [switch]$Reconfigure,
     [switch]$SkipFirewall,
-    [switch]$SetupOnly
+    [switch]$SetupOnly,
+    [switch]$DebugLog
 )
 
 $ErrorActionPreference = 'Stop'
@@ -66,7 +67,10 @@ try {
 
     if ($SetupOnly) { exit 0 }
     Write-Host 'Starting DeskMesh. Press Ctrl+C to stop.'
-    & $python deskmesh.py start
+    $runArgs = @('deskmesh.py')
+    if ($DebugLog) { $runArgs += '--debug' }
+    $runArgs += 'start'
+    & $python @runArgs
     exit $LASTEXITCODE
 } catch {
     Write-Error $_.Exception.Message

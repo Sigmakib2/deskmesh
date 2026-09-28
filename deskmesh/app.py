@@ -29,6 +29,8 @@ def require_windows() -> None:
 class Session:
     def __init__(self, sock: socket.socket, config: Config, key: bytes, session_id: bytes) -> None:
         self.sock = sock
+        if sock.family == socket.AF_INET:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.config = config
         self.key = key
         self.session_id = session_id
@@ -90,6 +92,8 @@ class Primary:
                 self.enqueue({"type": "release_all"})
             if self.state.switch(True):
                 logging.info("[ACTIVE] Secondary")
+            else:
+                logging.warning("Switch requested, but no secondary is connected")
             return was_local
         was_remote = self.state.remote
         self.state.switch(False)

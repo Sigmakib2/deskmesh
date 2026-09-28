@@ -56,6 +56,8 @@ user32.CallNextHookEx.restype = LRESULT
 user32.UnhookWindowsHookEx.argtypes = [wintypes.HHOOK]
 user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
 user32.SendInput.restype = wintypes.UINT
+user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+user32.GetAsyncKeyState.restype = ctypes.c_short
 
 LLKHF_EXTENDED = 0x01
 LLKHF_INJECTED = 0x10
@@ -118,6 +120,8 @@ class InputHooks:
         # Values indicate whether a key-up must reach the local PC. When
         # switching away, Ctrl/Alt were already pressed locally.
         self.hotkey_latch: dict[int, bool] = {}
+        self.poll_latch: set[str] = set()
+        self.reinstall_after_release = False
         self.keyboard_hook = None
         self.mouse_hook = None
         self._keyboard_callback = HOOKPROC(self._keyboard)
@@ -145,7 +149,34 @@ class InputHooks:
                     return
                 user32.TranslateMessage(ctypes.byref(msg))
                 user32.DispatchMessageW(ctypes.byref(msg))
+            self._poll_hotkeys()
             time.sleep(0.02)  # Also lets Python handle Ctrl+C while idle.
+
+    def _poll_hotkeys(self) -> None:
+        choices = (("emergency", self.recovery_hotkey), ("emergency", self.hotkeys["emergency"]), ("primary", self.hotkeys["primary"]), ("secondary", self.hotkeys["secondary"]))
+        active: set[str] = set()
+        for action, combo in choices:
+            if all(user32.GetAsyncKeyState(vk) & 0x8000 for vk in combo):
+                active.add(action)
+                if action not in self.poll_latch:
+                    self.poll_latch.add(action)
+                    logging.warning("Switch hotkey detected by fallback (%s); checking input hooks", action)
+                    self.on_switch(action)
+                    if action == "secondary":
+                        point = POINT()
+                        if user32.GetCursorPos(ctypes.byref(point)):
+                            self.anchor = point
+                    else:
+                        self.anchor = None
+                    self.reinstall_after_release = True
+        self.poll_latch = active
+        if self.reinstall_after_release and not active:
+            self.close()
+            self.install()
+            self.pressed.clear()
+            self.hotkey_latch.clear()
+            self.reinstall_after_release = False
+            logging.info("Input hooks reinstalled")
 
     def _keyboard(self, code: int, message: int, param: int) -> int:
         if code < 0:
@@ -166,9 +197,13 @@ class InputHooks:
                 # Generic modifier VKs and left/right variants both match.
                 normalized = {0xA0: 0x10, 0xA1: 0x10, 0xA2: 0x11, 0xA3: 0x11, 0xA4: 0x12, 0xA5: 0x12, 0x5C: 0x5B}
                 current = {normalized.get(key, key) for key in self.pressed}
+                if vk in (0x25, 0x27, 0x24):
+                    logging.debug("Hotkey candidate VK=%#x, pressed=%s", vk, sorted(current))
                 choices = (("emergency", self.recovery_hotkey), ("emergency", self.hotkeys["emergency"]), ("primary", self.hotkeys["primary"]), ("secondary", self.hotkeys["secondary"]))
                 for action, combo in choices:
                     if combo <= current and normalized.get(vk, vk) in combo:
+                        logging.info("Switch hotkey detected: %s", action)
+                        self.poll_latch.add(action)
                         was_local = self.on_switch(action)
                         for physical in self.pressed:
                             if normalized.get(physical, physical) in combo:
@@ -216,7 +251,9 @@ class InputHooks:
                 payload = {"type": "mouse_wheel", "delta": delta}
             suppress = self.on_event(payload) if payload else self.on_event(None)
             if suppress and message == WM_MOUSEMOVE and self.anchor is not None:
-                user32.SetCursorPos(self.anchor.x, self.anchor.y)
+                actual = POINT()
+                if user32.GetCursorPos(ctypes.byref(actual)) and (actual.x != self.anchor.x or actual.y != self.anchor.y):
+                    user32.SetCursorPos(self.anchor.x, self.anchor.y)
             return 1 if suppress else user32.CallNextHookEx(self.mouse_hook, code, message, param)
         except Exception:
             logging.exception("Mouse hook failed; restoring local input")

@@ -3,11 +3,13 @@ import threading
 import json
 import tempfile
 import unittest
+import ctypes
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
 from deskmesh.app import Primary
-from deskmesh.audio import JitterBuffer, PCM_BYTES, SILENCE, audio_key, pack_audio, unpack_audio
+from deskmesh.audio import AudioPacer, JitterBuffer, PCM_BYTES, SILENCE, audio_key, pack_audio, unpack_audio
 from deskmesh.auth import client_auth, server_auth
 from deskmesh.config import Config
 from deskmesh.auth import load_key
@@ -147,7 +149,7 @@ class SetupTests(unittest.TestCase):
                     try:
                         reply, _ = client.recvfrom(512)
                         break
-                    except socket.timeout:
+                    except (socket.timeout, ConnectionResetError):
                         continue
                 else:
                     self.fail("No discovery response")
@@ -185,8 +187,48 @@ class StateTests(unittest.TestCase):
         self.assertFalse(primary.on_switch("emergency"))
         self.assertEqual(primary.outbound.get_nowait(), {"type": "release_all"})
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows input hooks")
+    def test_hotkey_hook_switches_to_secondary(self):
+        from deskmesh.windows_input import InputHooks, KBDLLHOOKSTRUCT, WM_KEYDOWN
+
+        primary = Primary(Config(audio_receive=False), bytes(range(32)))
+        primary.state.connect()
+        hooks = InputHooks(primary.on_event, primary.on_switch, {"secondary": "ctrl+alt+right", "primary": "ctrl+alt+left", "emergency": "ctrl+alt+home"})
+        for vk in (0xA2, 0xA4, 0x27):
+            event = KBDLLHOOKSTRUCT(vk, 0, 0, 0, 0)
+            hooks._keyboard(0, WM_KEYDOWN, ctypes.addressof(event))
+        self.assertTrue(primary.state.remote)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows input hooks")
+    def test_poll_fallback_switches_and_reinstalls(self):
+        from deskmesh import windows_input as win
+
+        primary = Primary(Config(audio_receive=False), bytes(range(32)))
+        primary.state.connect()
+        hooks = win.InputHooks(primary.on_event, primary.on_switch, {"secondary": "ctrl+alt+right", "primary": "ctrl+alt+left", "emergency": "ctrl+alt+home"})
+        pressed = {0x11, 0x12, 0x27}
+        with patch.object(win.user32, "GetAsyncKeyState", side_effect=lambda vk: 0x8000 if vk in pressed else 0), patch.object(hooks, "close"), patch.object(hooks, "install") as install:
+            hooks._poll_hotkeys()
+            self.assertTrue(primary.state.remote)
+            pressed.clear()
+            hooks._poll_hotkeys()
+            install.assert_called_once()
+
 
 class AudioTests(unittest.TestCase):
+    def test_capture_pacer_waits_when_backend_returns_early(self):
+        class Stop:
+            waits = []
+
+            def wait(self, seconds):
+                self.waits.append(seconds)
+
+        with patch("deskmesh.audio.time.monotonic", return_value=100.0):
+            pacer = AudioPacer()
+            stop = Stop()
+            pacer.wait(stop)
+            self.assertAlmostEqual(stop.waits[0], 0.005)
+
     def test_packet_auth_and_session(self):
         key = audio_key(bytes(range(32)), b"session1")
         packet = pack_audio(key, b"session1", 7, bytes(PCM_BYTES))
@@ -215,6 +257,12 @@ class AudioTests(unittest.TestCase):
         for seq in range(100):
             buffer.push(seq, bytes(PCM_BYTES))
         self.assertLessEqual(len(buffer.packets), buffer.limit)
+
+    def test_silent_packet_is_not_underrun(self):
+        buffer = JitterBuffer(5)
+        buffer.push(1, SILENCE)
+        self.assertEqual(buffer.pop(), SILENCE)
+        self.assertEqual(buffer.underruns, 0)
 
 
 if __name__ == "__main__":
