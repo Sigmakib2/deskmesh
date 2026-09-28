@@ -1,0 +1,18 @@
+{
+  "role": "",
+  "connect": "",
+  "name": "MY-PC",
+  "control_port": 47660,
+  "audio_port": 47661,
+  "discovery_port": 47662,
+  "key_file": "deskmesh.key",
+  "switch_to_secondary": "ctrl+alt+right",
+  "switch_to_primary": "ctrl+alt+left",
+  "emergency_return": "ctrl+alt+home",
+  "audio_send": true,
+  "audio_receive": true,
+  "capture_device": "",
+  "playback_device": "",
+  "remote_volume": 0.7,
+  "buffer_ms": 100
+}
