@@ -8,13 +8,54 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
 
+function Test-StartedFromExplorer {
+    # A double-clicked launcher owns its console window, so an error would vanish
+    # before it could be read. Walking up to the owning shell tells the two apart;
+    # the command line cannot, since Explorer and PowerShell both use cmd /c "".
+    try {
+        $id = $PID
+        for ($hop = 0; $hop -lt 5; $hop++) {
+            $process = Get-CimInstance Win32_Process -Filter "ProcessId = $id" -ErrorAction Stop
+            if (-not $process -or -not $process.ParentProcessId) { return $false }
+            $parent = Get-CimInstance Win32_Process -Filter "ProcessId = $($process.ParentProcessId)" -ErrorAction Stop
+            if (-not $parent) { return $false }
+            switch -Regex ($parent.Name) {
+                '^explorer\.exe$' { return $true }
+                '^(powershell|pwsh|WindowsTerminal|wt|conhost|bash|code)\.exe$' { return $false }
+            }
+            $id = $parent.ProcessId
+        }
+    } catch { }
+    return $false
+}
+
 try {
     $python = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
     $requirements = Join-Path $PSScriptRoot 'requirements.txt'
     $stamp = Join-Path $PSScriptRoot '.venv\requirements.sha256'
 
+    function Get-PythonLauncher {
+        if (Get-Command py -ErrorAction SilentlyContinue) { return 'py' }
+        if (Get-Command python -ErrorAction SilentlyContinue) { return 'python' }
+        return $null
+    }
+
     if (-not (Test-Path -LiteralPath $python)) {
-        $launcher = if (Get-Command py -ErrorAction SilentlyContinue) { 'py' } elseif (Get-Command python -ErrorAction SilentlyContinue) { 'python' } else { throw 'Python 3.11+ is required. Install Python, then run this command again.' }
+        $launcher = Get-PythonLauncher
+        if (-not $launcher) {
+            Write-Host 'DeskMesh needs Python 3.11 or newer, which is not installed.'
+            if (Get-Command winget -ErrorAction SilentlyContinue) {
+                $answer = Read-Host 'Install it now with winget? [Y/n]'
+                if ($answer -eq '' -or $answer -match '^(y|yes)$') {
+                    Write-Host 'Installing Python...'
+                    & winget install --id Python.Python.3.12 --source winget --accept-package-agreements --accept-source-agreements
+                    # winget updates PATH for new processes only, so refresh this one.
+                    $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+                    $launcher = Get-PythonLauncher
+                }
+            }
+        }
+        if (-not $launcher) { throw 'Python 3.11+ is required. Install it from https://www.python.org/downloads/ (tick "Add python.exe to PATH"), then run this command again.' }
         Write-Host 'Creating local Python environment...'
         if ($launcher -eq 'py') { & py -3 -m venv .venv } else { & python -m venv .venv }
         if ($LASTEXITCODE -ne 0) { throw 'Could not create the Python environment.' }
@@ -24,17 +65,32 @@ try {
     $installed = (Test-Path -LiteralPath $stamp) -and ((Get-Content -LiteralPath $stamp -Raw).Trim() -eq $hash)
     if (-not $installed) {
         Write-Host 'Installing DeskMesh dependencies...'
+        # A newly created venv can ship a pip too old to see wheels for recent
+        # Python releases, which makes numpy try to build from source.
+        & $python -m pip install --upgrade pip --quiet
         & $python -m pip install -r $requirements
         if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed. Check internet access and retry.' }
         Set-Content -LiteralPath $stamp -Value $hash -Encoding Ascii
     }
 
-    $setupArgs = @('deskmesh.py', 'setup')
-    if ($Reconfigure) { $setupArgs += '--reset' }
-    & $python @setupArgs
-    if ($LASTEXITCODE -ne 0) { throw 'DeskMesh setup was not completed.' }
+    # Only run the wizard when there is something to ask; 'start' guides setup
+    # itself, so running it here every launch just prints a confusing notice.
+    $configPath = Join-Path $PSScriptRoot 'deskmesh.json'
+    $needsSetup = $Reconfigure -or -not (Test-Path -LiteralPath $configPath)
+    if (-not $needsSetup) {
+        try {
+            $existing = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+            if (-not $existing.role) { $needsSetup = $true }
+        } catch { $needsSetup = $true }
+    }
+    if ($needsSetup) {
+        $setupArgs = @('deskmesh.py', 'setup')
+        if ($Reconfigure) { $setupArgs += '--reset' }
+        & $python @setupArgs
+        if ($LASTEXITCODE -ne 0) { throw 'DeskMesh setup was not completed.' }
+    }
 
-    $config = Get-Content -LiteralPath 'deskmesh.json' -Raw | ConvertFrom-Json
+    $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
     if ($config.role -eq 'primary' -and -not $SkipFirewall) {
         $controlPort = if ($config.control_port) { [int]$config.control_port } else { 47660 }
         $audioPort = if ($config.audio_port) { [int]$config.audio_port } else { 47661 }
@@ -74,5 +130,9 @@ try {
     exit $LASTEXITCODE
 } catch {
     Write-Error $_.Exception.Message
+    if (Test-StartedFromExplorer) {
+        Write-Host ''
+        Read-Host 'Press Enter to close'
+    }
     exit 1
 }

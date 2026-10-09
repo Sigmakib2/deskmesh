@@ -29,6 +29,9 @@ class Config:
     buffer_ms: int = 100
     heartbeat_seconds: float = 1.0
     timeout_seconds: float = 4.0
+    # False leaves the primary's pairing window open. It closes after the first
+    # successful pairing so a later arrival on the LAN cannot ask to be paired.
+    paired: bool = False
 
 
 def load_config(path: str | None, overrides: dict | None = None) -> Config:
@@ -54,3 +57,15 @@ def load_config(path: str | None, overrides: dict | None = None) -> Config:
     if config.heartbeat_seconds <= 0 or config.timeout_seconds <= 2 * config.heartbeat_seconds:
         raise ValueError("timeout_seconds must exceed twice heartbeat_seconds")
     return config
+
+
+def update_config_file(path: str, changes: dict) -> None:
+    """Merge changes into a config file without disturbing other settings."""
+    target = Path(path)
+    data = json.loads(target.read_text(encoding="utf-8")) if target.exists() else {}
+    if not isinstance(data, dict):
+        raise ValueError("Configuration must be a JSON object")
+    data.update(changes)
+    temp = target.with_suffix(target.suffix + ".new")
+    temp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    temp.replace(target)
