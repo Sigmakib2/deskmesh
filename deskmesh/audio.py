@@ -127,7 +127,11 @@ def _loopback(name: str):
         matches = [device for device in devices if name.lower() in device.name.lower()]
     else:
         speaker = sc.default_speaker()
-        matches = [device for device in devices if device.id == speaker.id or speaker.name.lower() in device.name.lower()]
+        # An exact id match is unambiguous; only fall back to names when the
+        # loopback endpoint is not reported under the speaker's own id.
+        matches = [device for device in devices if device.id == speaker.id]
+        if not matches:
+            matches = [device for device in devices if speaker.name.lower() in device.name.lower()]
     if len(matches) != 1:
         raise ValueError(f"Loopback device '{name or 'default speaker'}' matched {len(matches)} devices; run devices and set capture_device")
     return matches[0]
@@ -178,6 +182,10 @@ def receive_audio(stop: threading.Event, bind: str, port: int, peer_ip: str, sha
     key = audio_key(shared_key, session)
     buffer = JitterBuffer(buffer_ms)
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        # A previous session's receiver can still be tearing down its WASAPI
+        # stream and holding this port; without this, reconnecting loses audio
+        # until DeskMesh is restarted.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((bind, port))
         sock.settimeout(0.2)
 

@@ -13,6 +13,10 @@ from pathlib import Path
 from .auth import load_key
 from .config import load_config
 from .discovery import discover
+from .pairing import Exchange, short_code, unwrap_key
+from .protocol import encode, receive
+
+PAIRING_WAIT_SECONDS = 180.0  # The person at the main PC has to read and confirm a code.
 
 
 def key_from_code(code: str) -> bytes:
@@ -59,14 +63,46 @@ def local_ipv4_addresses() -> list[str]:
     return sorted(addresses)
 
 
-def _ask_role() -> str:
+def _confirm(question: str, *, default: bool = True) -> bool:
+    suffix = "[Y/n]" if default else "[y/N]"
     while True:
-        answer = input("This PC is [1] main/server or [2] other device? ").strip().lower()
-        if answer in ("1", "main", "server", "primary"):
-            return "primary"
-        if answer in ("2", "other", "secondary", "client"):
-            return "secondary"
-        print("Enter 1 for the main PC or 2 for the other PC.")
+        answer = input(f"{question} {suffix} ").strip().lower()
+        if not answer:
+            return default
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            return False
+        print("Answer y or n.")
+
+
+def pair_with_primary(host: str, control_port: int, name: str) -> tuple[bytes, str]:
+    """Obtain the shared key from a running main PC without typing anything.
+
+    Both PCs print the same four digits. A man in the middle cannot make them
+    agree, so a mismatch means the person pairing should decline.
+    """
+    with socket.create_connection((host, control_port), timeout=10.0) as sock:
+        sock.settimeout(10.0)
+        exchange = Exchange()
+        sock.sendall(encode({"type": "pair_request", "public": exchange.public_hex, "name": name}))
+        offer = receive(sock)
+        if offer["type"] == "pair_reject":
+            raise ValueError(offer.get("reason") or "The main PC refused to pair")
+        if offer["type"] != "pair_offer":
+            raise ValueError("The main PC did not offer to pair")
+        shared = exchange.shared(offer["public"])
+        code = short_code(shared, exchange.public_hex, offer["public"])
+        print(f"\n  Pairing with {offer['name']}.")
+        print(f"  This code must match the one shown on {offer['name']}:  {code}")
+        print(f"  Confirm it there to continue. Waiting up to {int(PAIRING_WAIT_SECONDS / 60)} minutes...\n")
+        sock.settimeout(PAIRING_WAIT_SECONDS)
+        reply = receive(sock)
+        if reply["type"] == "pair_reject":
+            raise ValueError(reply.get("reason") or "The main PC declined")
+        if reply["type"] != "pair_accept":
+            raise ValueError("The main PC sent an unexpected pairing reply")
+        return unwrap_key(shared, reply["key"], reply["tag"]), offer["name"]
 
 
 def _ask_host() -> str:
@@ -105,6 +141,60 @@ def _choose_main(port: int) -> dict:
     return {"host": _ask_host()}
 
 
+def _detect_role(discovery_port: int) -> tuple[str, dict | None]:
+    """Decide the role from what is already on the network, then confirm it.
+
+    Discovery uses broadcasts, which some networks drop, so a wrong guess has to
+    be correctable: the answer decides which PC's keyboard everyone ends up
+    using, and that is worth one keystroke.
+    """
+    print("Looking for another DeskMesh on this network...")
+    try:
+        found = discover(discovery_port)
+    except OSError:
+        found = []
+    if found:
+        main = found[0] if len(found) == 1 else None
+        if main is None:
+            for index, item in enumerate(found, 1):
+                print(f"  [{index}] {item['name']} at {item['host']}")
+            while True:
+                answer = input("Which PC should control this one? Number, or N for none: ").strip().lower()
+                if answer == "n":
+                    break
+                if answer.isdigit() and 1 <= int(answer) <= len(found):
+                    main = found[int(answer) - 1]
+                    break
+                print("Enter a listed number or N.")
+        if main is not None:
+            print(f"Found {main['name']} at {main['host']}.")
+            if _confirm(f"Let {main['name']}'s keyboard and mouse control this PC?"):
+                return "secondary", main
+            return "primary", None
+    else:
+        print("No other DeskMesh is running here yet.")
+    if _confirm("Share this PC's keyboard, mouse and headset with another PC?"):
+        return "primary", None
+    return "secondary", None
+
+
+def _pair_or_ask_for_code(host: str, control_port: int, name: str) -> bytes:
+    """Pair automatically, falling back to the typed code if that cannot work."""
+    try:
+        key, peer_name = pair_with_primary(host, control_port, name)
+        print(f"Paired with {peer_name}.")
+        return key
+    except (OSError, ConnectionError, ValueError) as exc:
+        print(f"\nAutomatic pairing did not complete: {exc}")
+    if not _confirm("Enter the backup pairing code from the main PC instead?"):
+        raise ValueError("Pairing was not completed; run setup again when the main PC is running")
+    while True:
+        try:
+            return key_from_code(input("Backup pairing code from the main PC: ").strip())
+        except ValueError as exc:
+            print(exc)
+
+
 def _write_key(path: Path, key: bytes) -> None:
     if path.exists():
         answer = input(f"{path} already exists. Replace it with the new pairing key? [y/N] ").strip().lower()
@@ -113,7 +203,7 @@ def _write_key(path: Path, key: bytes) -> None:
     path.write_text(key.hex() + "\n", encoding="ascii")
 
 
-def setup_interactive(path: str = "deskmesh.json", *, reset: bool = False) -> None:
+def setup_interactive(path: str = "deskmesh.json", *, reset: bool = False, quiet: bool = False) -> None:
     target = Path(path)
     data = json.loads(target.read_text(encoding="utf-8")) if target.exists() else {}
     if not isinstance(data, dict):
@@ -121,35 +211,35 @@ def setup_interactive(path: str = "deskmesh.json", *, reset: bool = False) -> No
     existing = load_config(path if target.exists() else None)
     if existing.role and not reset:
         load_key(existing.key_file)
-        print(f"Already configured as {existing.role}. Run the same command to start.")
+        if not quiet:
+            print(f"Already configured as {existing.role}. Run the same command to start.")
         return
-    print("\nDeskMesh first-time setup")
-    role = _ask_role()
+    print("\nDeskMesh setup")
+    name = data.get("name") or socket.gethostname()
+    role, main = _detect_role(int(data.get("discovery_port", 47662)))
     key_path = Path(data.get("key_file", "deskmesh.key"))
     if role == "primary":
         code, key = new_pairing()
         _write_key(key_path, key)
         data.pop("connect", None)
-        print("\nOn the other PC, enter this pairing code:")
-        print(f"  {code}")
+        data["paired"] = False  # Open the pairing window for the other PC.
         addresses = local_ipv4_addresses()
-        print("Main PC LAN address(es): " + (", ".join(addresses) if addresses else "run ipconfig to find IPv4 address"))
-        print("Keep the pairing code private. The other PC will ask for it once.")
+        print("\nThis PC will share its keyboard, mouse and headset.")
+        print("  LAN address: " + (", ".join(addresses) if addresses else "run ipconfig to find the IPv4 address"))
+        print("  Run DeskMesh on the other PC now; it will find this one and ask to pair.")
+        print(f"  Backup pairing code, only needed if that fails:  {code}")
     else:
-        main = _choose_main(int(data.get("discovery_port", 47662)))
+        if main is None:
+            main = {"host": _ask_host()}
         data["connect"] = main["host"]
         for field in ("control_port", "audio_port"):
             if field in main:
                 data[field] = main[field]
-        while True:
-            try:
-                key = key_from_code(input("Pairing code shown on main PC: ").strip())
-                break
-            except ValueError as exc:
-                print(exc)
+        control_port = int(data.get("control_port", 47660))
+        key = _pair_or_ask_for_code(main["host"], control_port, name)
         _write_key(key_path, key)
     data["role"] = role
-    data.setdefault("name", socket.gethostname())
+    data.setdefault("name", name)
     data.setdefault("key_file", str(key_path))
     # Verify before persisting. Existing advanced settings remain intact.
     temp = target.with_suffix(target.suffix + ".new")

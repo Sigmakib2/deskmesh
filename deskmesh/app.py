@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import logging
+import logging.handlers
 import platform
 import queue
 import socket
@@ -14,8 +16,9 @@ from pathlib import Path
 
 from .audio import list_devices, receive_audio, send_audio
 from .auth import client_auth, generate_key, load_key, server_auth
-from .config import Config, load_config
+from .config import Config, load_config, update_config_file
 from .discovery import respond
+from .pairing import Exchange, short_code, wrap_key
 from .protocol import encode, receive
 from .setup import code_from_key, setup_interactive
 from .state import ActiveState, PressedState
@@ -24,6 +27,27 @@ from .state import ActiveState, PressedState
 def require_windows() -> None:
     if platform.system() != "Windows":
         raise RuntimeError("Input and system audio require Windows 10/11")
+
+
+def configure_logging(debug: bool) -> None:
+    """Send every log record through a queue so no caller blocks on the console.
+
+    Low-level input hook callbacks must return within the Windows
+    LowLevelHooksTimeout (300 ms by default) or Windows silently removes the
+    hook. A console write can exceed that, so the callbacks only enqueue and a
+    listener thread does the writing.
+    """
+    records: queue.SimpleQueue = queue.SimpleQueue()
+    console = logging.StreamHandler()
+    console.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    listener = logging.handlers.QueueListener(records, console, respect_handler_level=True)
+    root = logging.getLogger()
+    for handler in root.handlers[:]:
+        root.removeHandler(handler)
+    root.addHandler(logging.handlers.QueueHandler(records))
+    root.setLevel(logging.DEBUG if debug else logging.INFO)
+    listener.start()
+    atexit.register(listener.stop)
 
 
 class Session:
@@ -45,6 +69,15 @@ class Session:
 
     def heartbeat(self) -> None:
         while not self.stop.wait(self.config.heartbeat_seconds):
+            if time.monotonic() - self.last_heartbeat > self.config.timeout_seconds:
+                logging.warning("No heartbeat from peer for %.1fs; dropping the session", self.config.timeout_seconds)
+                self.stop.set()
+                # Unblock the reader, which is parked in a blocking receive().
+                try:
+                    self.sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                return
             try:
                 self.send({"type": "heartbeat"})
             except OSError:
@@ -58,6 +91,8 @@ class Session:
         def run() -> None:
             try:
                 target(self.stop, *args)
+            except OSError as exc:
+                logging.error("Audio unavailable: %s. Input still works; restart DeskMesh to retry audio", exc)
             except Exception:
                 logging.exception("Audio stopped; input connection remains available. Check devices with 'devices'")
 
@@ -72,18 +107,56 @@ class Session:
             pass
         self.sock.close()
         if self.audio_thread:
-            self.audio_thread.join(timeout=1)
+            # Tearing down a WASAPI stream can take longer than a second; a thread
+            # that outlives this join keeps the audio port bound and breaks the
+            # next connection's bind.
+            self.audio_thread.join(timeout=5)
+            if self.audio_thread.is_alive():
+                logging.warning("Audio thread did not stop; the audio port may stay busy briefly")
 
 
 class Primary:
-    def __init__(self, config: Config, key: bytes) -> None:
+    def __init__(self, config: Config, key: bytes, config_path: str | None = None) -> None:
         self.config = config
         self.key = key
+        self.config_path = config_path
+        self.paired = config.paired
         self.state = ActiveState()
         self.current: Session | None = None
         self.outbound: queue.Queue[dict] = queue.Queue(maxsize=4096)
         self.stop = threading.Event()
         self._lock = threading.Lock()
+        self._peer_gate = threading.Lock()
+
+    def handle_pairing(self, sock: socket.socket, address: tuple[str, int], request: dict) -> None:
+        """Hand this PC's key to a new secondary once a person confirms the code."""
+        if self.paired:
+            logging.warning("Refused a pairing request from %s: this PC is already paired. Run 'deskmesh -Reconfigure' to pair a different PC", address[0])
+            sock.sendall(encode({"type": "pair_reject", "reason": "Already paired; run 'deskmesh -Reconfigure' on the main PC to pair another PC"}))
+            return
+        exchange = Exchange()
+        shared = exchange.shared(request["public"])
+        sock.sendall(encode({"type": "pair_offer", "public": exchange.public_hex, "name": self.config.name}))
+        code = short_code(shared, request["public"], exchange.public_hex)
+        logging.info("Pairing request from %s (%s)", request["name"], address[0])
+        print(f"\n  {request['name']} at {address[0]} wants to pair.")
+        print(f"  Confirm this code matches the one on that PC:  {code}\n")
+        answer = input("  Pair with this PC? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            sock.sendall(encode({"type": "pair_reject", "reason": "The person at the main PC declined"}))
+            logging.info("Pairing declined")
+            return
+        wrapped, tag = wrap_key(shared, self.key)
+        # Close the window before handing the key over: if the send or the config
+        # write then fails, the window stays shut rather than open to the network.
+        self.paired = True
+        sock.sendall(encode({"type": "pair_accept", "key": wrapped, "tag": tag}))
+        if self.config_path:
+            try:
+                update_config_file(self.config_path, {"paired": True})
+            except OSError as exc:
+                logging.warning("Could not record the pairing in %s: %s", self.config_path, exc)
+        logging.info("Paired with %s. %s will reconnect to start sharing", request["name"], request["name"])
 
     def on_switch(self, action: str) -> bool:
         was_local = not self.state.remote
@@ -137,9 +210,47 @@ class Primary:
                 return
 
     def serve_peer(self, sock: socket.socket, address: tuple[str, int]) -> None:
-        session: Session | None = None
+        """Dispatch one inbound connection to either pairing or a control session."""
         try:
             sock.settimeout(self.config.timeout_seconds)
+            # The client states its intent first: an unpaired PC asks to pair,
+            # a paired one goes straight into authentication.
+            intent = receive(sock)
+        except (OSError, ConnectionError, ValueError) as exc:
+            logging.warning("Ignored a connection from %s: %s", address[0], exc)
+            sock.close()
+            return
+        if intent["type"] not in ("pair_request", "connect"):
+            logging.warning("Ignored a connection from %s: expected connect or pair_request", address[0])
+            sock.close()
+            return
+        # DeskMesh serves one PC at a time. Claim that slot without waiting so an
+        # extra PC is told why instead of being left hanging in the backlog.
+        if not self._peer_gate.acquire(blocking=False):
+            logging.warning("Refused a connection from %s: already busy with another PC", address[0])
+            if intent["type"] == "pair_request":
+                try:
+                    sock.sendall(encode({"type": "pair_reject", "reason": "The main PC is already busy with another PC"}))
+                except OSError:
+                    pass
+            sock.close()
+            return
+        try:
+            if intent["type"] == "pair_request":
+                try:
+                    self.handle_pairing(sock, address, intent)
+                except (OSError, ConnectionError, ValueError) as exc:
+                    logging.warning("Pairing with %s failed: %s", address[0], exc)
+                finally:
+                    sock.close()
+            else:
+                self.serve_session(sock, address)
+        finally:
+            self._peer_gate.release()
+
+    def serve_session(self, sock: socket.socket, address: tuple[str, int]) -> None:
+        session: Session | None = None
+        try:
             session_id = server_auth(sock, self.key)
             peer = receive(sock)
             if peer["type"] != "hello":
@@ -184,7 +295,13 @@ class Primary:
                     sock, address = listener.accept()
                 except socket.timeout:
                     continue
-                self.serve_peer(sock, address)
+                except OSError:
+                    if not self.stop.is_set():
+                        logging.exception("Stopped accepting connections")
+                    return
+                # Handled off this thread so a live session does not stall the
+                # listener; serve_peer refuses anything beyond the first PC.
+                threading.Thread(target=self.serve_peer, args=(sock, address), daemon=True, name="peer").start()
 
     def run(self) -> None:
         from .windows_input import InputHooks
@@ -247,12 +364,17 @@ def apply_input(message: dict, held: PressedState) -> None:
 
 
 def run_secondary(config: Config, key: bytes, host: str) -> None:
+    from .windows_input import reset_cursor
+
     while True:
         session: Session | None = None
         held = PressedState()
+        retry_seconds = 3
+        reset_cursor()  # Track from this PC's real cursor again, not the last session's.
         try:
             with socket.create_connection((host, config.control_port), timeout=config.timeout_seconds) as sock:
                 sock.settimeout(config.timeout_seconds)
+                sock.sendall(encode({"type": "connect"}))
                 session_id = client_auth(sock, key)
                 session = Session(sock, config, key, session_id)
                 session.send({"type": "hello", "name": config.name})
@@ -272,7 +394,12 @@ def run_secondary(config: Config, key: bytes, host: str) -> None:
                     else:
                         apply_input(message, held)
         except (OSError, ConnectionError, ValueError) as exc:
-            logging.warning("Primary unavailable: %s", exc)
+            if "Authentication failed" in str(exc):
+                # Retrying cannot help until the key changes; slow down and say so.
+                retry_seconds = 15
+                logging.error("Authentication failed: this PC's pairing key does not match the main PC. Run 'deskmesh -Reconfigure' on the main PC, then here, and pair again")
+            else:
+                logging.warning("Primary unavailable: %s", exc)
         finally:
             try:
                 release_remote(held)
@@ -280,8 +407,8 @@ def run_secondary(config: Config, key: bytes, host: str) -> None:
                 logging.exception("Could not release a remote input")
             if session:
                 session.close()
-        logging.info("Reconnecting in 3 seconds; press Ctrl+C to exit")
-        time.sleep(3)
+        logging.info("Reconnecting in %d seconds; press Ctrl+C to exit", retry_seconds)
+        time.sleep(retry_seconds)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -306,7 +433,7 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--no-audio", action="store_true")
     args = parser.parse_args(argv)
     command = args.command or "start"
-    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO, format="[%(levelname)s] %(message)s")
+    configure_logging(args.debug)
     try:
         if command == "generate-key":
             generate_key(args.key_file)
@@ -321,7 +448,9 @@ def main(argv: list[str] | None = None) -> int:
             setup_interactive(args.config or "deskmesh.json", reset=args.reset)
             return 0
         if command == "start":
-            setup_interactive(args.config or "deskmesh.json")
+            # start.ps1 already ran setup to learn the role for firewall rules, so
+            # stay quiet here when this PC is configured and nothing needs asking.
+            setup_interactive(args.config or "deskmesh.json", quiet=True)
             config_path = args.config or "deskmesh.json"
         if command == "pairing-code":
             config = load_config(config_path)
@@ -338,7 +467,7 @@ def main(argv: list[str] | None = None) -> int:
         key = load_key(config.key_file)
         role = config.role if command == "start" else command
         if role == "primary":
-            Primary(config, key).run()
+            Primary(config, key, config_path).run()
         else:
             host = config.connect if command == "start" else args.connect
             if not host:

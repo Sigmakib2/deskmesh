@@ -7,7 +7,8 @@ import socket
 import struct
 
 MAX_MESSAGE = 4096
-TYPES = {"challenge", "authenticate", "authenticated", "hello", "heartbeat", "keyboard", "mouse_move", "mouse_button", "mouse_wheel", "release_all", "disconnect"}
+PUBLIC_HEX_LENGTH = 512  # A 2048-bit Diffie-Hellman public value.
+TYPES = {"challenge", "authenticate", "authenticated", "hello", "heartbeat", "keyboard", "mouse_move", "mouse_button", "mouse_wheel", "release_all", "disconnect", "connect", "pair_request", "pair_offer", "pair_accept", "pair_reject"}
 
 
 def validate(message: object) -> dict:
@@ -33,7 +34,23 @@ def validate(message: object) -> dict:
     elif kind == "hello":
         if not isinstance(message.get("name"), str) or not 1 <= len(message["name"].encode("utf-8")) <= 64:
             raise ValueError("Invalid peer name")
+    elif kind in ("pair_request", "pair_offer"):
+        if not _is_hex(message.get("public"), PUBLIC_HEX_LENGTH):
+            raise ValueError("Invalid pairing public value")
+        if not isinstance(message.get("name"), str) or not 1 <= len(message["name"].encode("utf-8")) <= 64:
+            raise ValueError("Invalid peer name")
+    elif kind == "pair_accept":
+        if not _is_hex(message.get("key"), 64) or not _is_hex(message.get("tag"), 64):
+            raise ValueError("Invalid pairing acceptance")
+    elif kind == "pair_reject":
+        reason = message.get("reason", "")
+        if not isinstance(reason, str) or len(reason) > 200:
+            raise ValueError("Invalid pairing rejection")
     return message
+
+
+def _is_hex(value: object, length: int) -> bool:
+    return isinstance(value, str) and len(value) == length and all(character in "0123456789abcdefABCDEF" for character in value)
 
 
 def encode(message: dict) -> bytes:
