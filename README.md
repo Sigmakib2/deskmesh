@@ -6,17 +6,19 @@ DeskMesh shares the keyboard and mouse attached to a primary Windows PC with a s
 
 ## Quick setup
 
-Put a copy of this folder on both PCs. Then, on each one, run:
+Put a copy of this folder on both PCs. Then, on each one, open its folder and run:
 
-```
-deskmesh
+```powershell
+.\deskmesh
 ```
 
 Or just double-click `deskmesh.cmd`. That is the whole command, and it is the same on both PCs — there is no role to pick and no code to type.
 
+The leading `.\` matters in PowerShell, which does not look in the current folder for programs; a bare `deskmesh` reports "not found" even with `deskmesh.cmd` sitting right there. In `cmd.exe` either spelling works.
+
 Run it on the **PC with the keyboard, mouse and headset first**. On first launch DeskMesh creates a local Python environment and installs its dependencies. If Python is missing it offers to install it with winget. Then:
 
-1. **The first PC** finds nothing on the network, so it offers to be the one that shares its keyboard. Press Enter. It prints its LAN address and waits. Windows may ask for administrator approval to add three firewall rules for **Private** networks.
+1. **The first PC** finds nothing on the network, so it offers to be the one that shares its keyboard. Press Enter. It prints its LAN address and waits. Windows may ask for administrator approval to add three firewall rules for **Private** networks. Your Windows network must be set to **Private**, not Public, or the other PC cannot reach this one — DeskMesh warns if it is not.
 2. **The second PC** finds the first one and asks whether to let it take over. Press Enter. Both PCs then show the **same four digits**.
 3. **Back on the first PC**, check the digits match and press `y`. Pairing is done; the second PC connects on its own.
 
@@ -28,8 +30,8 @@ DeskMesh saves the shared key in `deskmesh.key` on each PC and the role and main
 
 To start over on either PC:
 
-```
-deskmesh -Reconfigure
+```powershell
+.\deskmesh -Reconfigure
 ```
 
 Changing the main PC's key requires reconfiguring the other PC too.
@@ -51,9 +53,9 @@ The main PC accepts TCP port `47660` for control, UDP port `47661` for audio, an
 
 ### Manual commands
 
-`deskmesh` is recommended. Advanced users can still create a key with `deskmesh.py generate-key`, copy it privately to the other PC, and run `deskmesh.py primary` or `deskmesh.py secondary --connect MAIN_IP`. Add `--no-audio` after either role to test input without audio. These manual commands do not change the saved setup role.
+`.\deskmesh` is recommended. Advanced users can still create a key with `deskmesh.py generate-key`, copy it privately to the other PC, and run `deskmesh.py primary` or `deskmesh.py secondary --connect MAIN_IP`. Add `--no-audio` after either role to test input without audio. These manual commands do not change the saved setup role.
 
-`deskmesh` passes its arguments through to `start.ps1`, so `-Reconfigure`, `-DebugLog`, `-SkipFirewall` and `-SetupOnly` all work on it.
+`.\deskmesh` passes its arguments through to `start.ps1`, so `-Reconfigure`, `-DebugLog`, `-SkipFirewall` and `-SetupOnly` all work on it.
 
 ## Use
 
@@ -76,13 +78,13 @@ The primary's normal Windows audio continues through its usual output. Remote au
 ## Troubleshooting
 
 - **Connection refused or timeout:** Start the main PC first, verify its displayed IPv4 address, put both PCs on the same Private LAN, and approve the main PC firewall prompt. The other PC retries automatically.
-- **Authentication failed:** The two PCs no longer share a key. Run `deskmesh -Reconfigure` on the main PC, then on the other one, and pair again.
-- **"Already paired" when pairing a new PC:** The main PC closes its pairing window after the first success. Run `deskmesh -Reconfigure` there to open it again.
+- **Authentication failed:** The two PCs no longer share a key. Run `.\deskmesh -Reconfigure` on the main PC, then on the other one, and pair again.
+- **"Already paired" when pairing a new PC:** The main PC closes its pairing window after the first success. Run `.\deskmesh -Reconfigure` there to open it again.
 - **The four digits do not match:** Press `n`. Re-run pairing on a network you trust; mismatched digits mean the two PCs are not talking directly.
 - **No remote audio:** Check that the secondary plays through the selected output, list devices on both PCs, and verify UDP `47661` is allowed through the primary firewall. Try a specific `capture_device` and `playback_device`. Loopback capture is silent while the secondary is playing nothing at all.
 - **Input is not injected into an elevated app:** Windows prevents a normal-privilege process from injecting into higher-privilege windows. Run the secondary DeskMesh process at the needed privilege level only if you trust it.
 - **Hotkeys fail:** Run the primary from an interactive desktop session. Windows secure desktop (such as the UAC prompt and lock screen) cannot be controlled by these hooks.
-- **Hotkeys or audio behaving oddly:** Start both PCs with `deskmesh -DebugLog`. The main PC logs detected hotkeys and audio buffer health. Send the last few terminal lines from both PCs when reporting a problem.
+- **Hotkeys or audio behaving oddly:** Start both PCs with `.\deskmesh -DebugLog`. The main PC logs detected hotkeys and audio buffer health. Send the last few terminal lines from both PCs when reporting a problem.
 - **Unexpected stop:** The same `-DebugLog` option provides detailed logs. Manual commands can use `deskmesh.py --debug primary`.
 
 ## Security and limits
